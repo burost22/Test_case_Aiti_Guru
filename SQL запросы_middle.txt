@@ -1,0 +1,86 @@
+SQL запросы:
+2.1.Получение информации о сумме товаров заказанных под каждого клиента (Наименование клиента, сумма)
+
+
+SELECT 
+  c.client_id,
+  c.name AS client_name,
+  COALESCE(SUM(oi.total), 0) AS total_sum
+FROM clients AS c
+LEFT JOIN orders AS o ON o.client_id = c.client_id
+LEFT JOIN order_items AS oi ON oi.order_id = o.order_id
+GROUP BY c.client_id, client_name
+ORDER BY total_sum DESC
+
+
+2.2.Найти количество дочерних элементов первого уровня вложенности для категорий номенклатуры.
+
+
+SELECT 
+  p.category_id,
+  p.name AS category_name,
+  COUNT(cc.descendant_id) AS child_count
+FROM categories AS p
+LEFT JOIN category_closure AS cc
+  ON cc.ancestor_id = p.category_id
+  AND cc.depth =1
+GROUP BY p.category_id, category_name
+ORDER BY child_count DESC
+
+2.3.1.Написать текст запроса для отчета(view) «Топ-5 самых покупаемых товаров за последний месяц» (по количеству штук в заказах). В отчете должны быть: Наименование товара, Категория 1-гоуровня, Общее количество проданных штук.
+CREATE OR REPLACE VIEW top_5_products_in_lost_month AS
+WITH sales AS (
+  SELECT
+  oi.product_id,SUM(oi.quantity) AS sold
+  FROM order_items AS oi
+  JOIN orders AS o ON o.order_id = oi.order_id
+  WHERE o.order_date >= current_date  - interval '1 mounth'
+  GROUP BY oi.product_id
+),
+prodcut_top_cat AS (
+  SELECT pc.product_id,
+  cc.ancestor_id AS top_category_id
+  ROW_NUMBER() OVER (PARTITION BY pc.product_id ORDER BY cc.depth DESC, cc.ancestor_id) AS rn 
+  FROM product_category AS pc
+  JOIN category_closure AS cc ON cc.descendant_id = pc.category_id 
+)
+SELECT
+  p.product_id
+  p.name AS product_name
+  top.category_id AS top_category_id,
+  top.name AS top_category_name
+  COALESCE(s.sold, 0) AS sold
+  FROM products AS p
+  LEFT JOIN sales AS s ON s.product_id = p.product_id
+  LEFT JOIN (
+    SELECT product_id, top_category_id
+    FROM prodcut_top_cat
+    WHERE rn = 1
+  ) AS t ON t.product_id = p.product_id
+  LEFT JOIN categories AS top ON top.category_id = t.top_category_id
+  
+2.3.2.Проанализировать написанный в п.2.3.1 запрос и структуру БД. Предложить варианты оптимизации этого запроса и общей схемы данных для повышения производительности системы в условиях роста данных (тысячи заказов в день).
+Создать индексы
+CREATE INDEX idx_orders_order_date_status ON orders (order_date, status);
+CREATE INDEX idx_order_items_order_id ON order_items (order_id);
+CREATE INDEX idx_order_items_product_id ON order_items (product_id);
+CREATE INDEX idx_product_category_product ON product_category (product_id);
+CREATE INDEX idx_cc_descendant_depth ON category_closure (descendant_id, depth);
+CREATE INDEX idx_cc_ancestor_depth ON category_closure (ancestor_id, depth);
+
+B. Материализация / кеширование отчёта
+Materialized view вместо обычного VIEW. Преимущество — результат считается один раз и быстро отдаётся:
+
+CREATE MATERIALIZED VIEW mv_product_monthly_sales AS
+-- тот же SELECT, что и для vw_product_monthly_sales
+;
+CREATE UNIQUE INDEX mv_prod_idx ON mv_product_monthly_sales (product_id);
+Обновлять REFRESH MATERIALIZED VIEW CONCURRENTLY mv_product_monthly_sales; по расписанию (например каждые N минут/часов) через cron / pg_cron. CONCURRENTLY позволяет не блокировать чтение, но требует уникального индекса.
+
+D. Предагрегация (склады/факт-таблицы)
+Ввести таблицу daily_product_sales (date, product_id, qty_sold) и обновлять/вставлять туда в фоновой задаче (ETL) или триггером/потоком (например Debezium). Для отчётов просто суммировать нужный диапазон дат → очень быстро.
+При потоках заказов в реальном времени это масштабируемо и позволяет легко строить топы за произвольные периоды.
+. Обработка статуса заказов и возвратов
+В отчётах важно учитывать отмены и возвраты. Храните отдельные события (order_status_events) или колонки quantity_returned. Важно, чтобы отчёт исключал отменённые позиции корректно
+
+
